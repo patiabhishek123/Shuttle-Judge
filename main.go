@@ -445,7 +445,7 @@ func processMessage(ctx context.Context, pool *pgxpool.Pool, cfg *Config, req Me
 			var questionCount int
 			err = tx.QueryRow(ctx, `
 				SELECT COUNT(*) FROM messages_log 
-				WHERE case_id = $1 AND party_id = $2 AND direction = 'out'`).Scan(&questionCount)
+				WHERE case_id = $1 AND party_id = $2 AND direction = 'out'`, caseID, partyID).Scan(&questionCount)
 			if err != nil {
 				return "", err
 			}
@@ -496,7 +496,7 @@ func processMessage(ctx context.Context, pool *pgxpool.Pool, cfg *Config, req Me
 			var questionCount int
 			err = tx.QueryRow(ctx, `
 				SELECT COUNT(*) FROM messages_log 
-				WHERE case_id = $1 AND party_id = $2 AND direction = 'out'`).Scan(&questionCount)
+				WHERE case_id = $1 AND party_id = $2 AND direction = 'out'`, caseID, partyID).Scan(&questionCount)
 			if err != nil {
 				return "", err
 			}
