@@ -1056,6 +1056,7 @@ func callOpenRouterJSON(ctx context.Context, cfg *Config, systemPrompt, userProm
 			{"role": "user", "content": userPrompt},
 		},
 		"response_format": map[string]string{"type": "json_object"},
+		"max_tokens":      1000,
 	}
 
 	bodyBytes, err := json.Marshal(payload)
@@ -1107,7 +1108,23 @@ func callOpenRouterJSON(ctx context.Context, cfg *Config, systemPrompt, userProm
 	}
 
 	contentStr := openRouterResponse.Choices[0].Message.Content
-	return json.Unmarshal([]byte(contentStr), result)
+	
+	// Clean markdown JSON wrapping if present
+	cleaned := strings.TrimSpace(contentStr)
+	if strings.HasPrefix(cleaned, "```json") {
+		cleaned = strings.TrimPrefix(cleaned, "```json")
+		cleaned = strings.TrimSuffix(cleaned, "```")
+	} else if strings.HasPrefix(cleaned, "```") {
+		cleaned = strings.TrimPrefix(cleaned, "```")
+		cleaned = strings.TrimSuffix(cleaned, "```")
+	}
+	cleaned = strings.TrimSpace(cleaned)
+
+	if err := json.Unmarshal([]byte(cleaned), result); err != nil {
+		log.Printf("Failed to unmarshal model content: %s", contentStr)
+		return fmt.Errorf("failed to unmarshal model content: %w (raw content: %q, cleaned: %q)", err, contentStr, cleaned)
+	}
+	return nil
 }
 
 // --- Database Helper Functions ---

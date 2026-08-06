@@ -16,9 +16,9 @@ async function sendMsg(convId, sender, text) {
 
 async function run() {
     try {
-        console.log("=== STARTING SHUTTLE COURT MEDIATION FLOW TEST ===");
+        console.log("=== STARTING DYNAMIC SHUTTLE COURT MEDIATION FLOW TEST ===");
 
-        // 1. Party A opens the case
+        // --- PARTY A INTAKE ---
         let reply = await sendMsg(
             'conv_party_a', 
             'party_a@example.com', 
@@ -33,63 +33,65 @@ async function run() {
         const joinCode = joinCodeMatch[1];
         console.log(`>>> Extracted Join Code: ${joinCode}`);
 
-        // 2. Party A continues intake (provides clarifications)
-        await sendMsg(
-            'conv_party_a',
-            'party_a@example.com',
-            'I paid $340 on March 15 for electricity. I want them to pay half ($170).'
-        );
+        // Party A interaction loop
+        let attempts = 0;
+        while (attempts < 5) {
+            attempts++;
+            if (reply.includes("is that right?") || reply.includes("is this correct?")) {
+                reply = await sendMsg('conv_party_a', 'party_a@example.com', 'Yes, that is correct.');
+                break;
+            } else if (reply.includes("waiting for the other party to join")) {
+                break;
+            } else {
+                reply = await sendMsg('conv_party_a', 'party_a@example.com', 'I paid $340 on March 15 for electricity. I want them to pay half ($170).');
+            }
+        }
 
-        // 3. Party A confirms restatement
-        await sendMsg(
-            'conv_party_a',
-            'party_a@example.com',
-            'Yes, that is correct.'
-        );
-
-        // 4. Party B joins using the join code
-        await sendMsg(
+        // --- PARTY B JOINS ---
+        reply = await sendMsg(
             'conv_party_b',
             'party_b@example.com',
             joinCode
         );
 
-        // 5. Party B provides their side (deliberate contradiction: $300 instead of $340)
-        await sendMsg(
-            'conv_party_b',
-            'party_b@example.com',
-            'I paid $150 for March electricity. The bill was actually $300 total.'
-        );
+        // Party B interaction loop
+        attempts = 0;
+        let contradictionResolved = false;
+        while (attempts < 10) {
+            attempts++;
+            if (reply.includes("Do you accept this proposal?") || reply.includes("resolution proposal:")) {
+                console.log(">>> Proposal received by Party B!");
+                break;
+            } else if (reply.includes("is that right?") || reply.includes("is this correct?")) {
+                reply = await sendMsg('conv_party_b', 'party_b@example.com', 'Yes, that is correct.');
+            } else if (reply.includes("double check") || reply.includes("receipt") || reply.includes("exactly") || reply.includes("amount") || reply.includes("Who paid")) {
+                if (!contradictionResolved) {
+                    reply = await sendMsg('conv_party_b', 'party_b@example.com', 'Ah, sorry, looking at the bill statement again, it was indeed $340. I was looking at the February one.');
+                    contradictionResolved = true;
+                } else {
+                    reply = await sendMsg('conv_party_b', 'party_b@example.com', 'It was definitely $340.');
+                }
+            } else {
+                reply = await sendMsg('conv_party_b', 'party_b@example.com', 'I paid $150 for March electricity. The bill was actually $300 total.');
+            }
+        }
 
-        // 6. Party B confirms restatement
-        await sendMsg(
-            'conv_party_b',
-            'party_b@example.com',
-            'Yes, that is correct.'
-        );
-
-        // 7. Party B responds to the cross-check question (resolving the contradiction)
-        await sendMsg(
-            'conv_party_b',
-            'party_b@example.com',
-            'Ah, sorry, looking at the bill statement again, it was indeed $340. I was looking at the February one.'
-        );
-
-        // 8. Party A votes YES on the proposal
-        await sendMsg(
+        // --- CONSENT PHASE ---
+        // A votes YES
+        reply = await sendMsg(
             'conv_party_a',
             'party_a@example.com',
             'YES'
         );
 
-        // 9. Party B votes YES on the proposal
-        await sendMsg(
+        // B votes YES
+        reply = await sendMsg(
             'conv_party_b',
             'party_b@example.com',
             'YES'
         );
 
-        console.log("\n=== FLOW TEST COMPLETED SUCCESSFULLY ===");
+        console.log("\n=== DYNAMIC FLOW TEST COMPLETED SUCCESSFULLY ===");
     } catch (e) {
         console.error("Test failed:", e.message);
         if (e.response && e.response.data) {

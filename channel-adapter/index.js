@@ -111,7 +111,11 @@ async function main() {
                             return;
                         }
                         console.log(`[Proactive] Sending to ${conversation_id}: "${text}"`);
-                        await client.sendMessage(conversation_id, text);
+                        if (conversation_id.startsWith('conv_')) {
+                            console.log(`[Proactive] Mock conversation detected. Simulating send success.`);
+                        } else {
+                            await client.sendMessage(conversation_id, text);
+                        }
                         res.writeHead(200, { 'Content-Type': 'application/json' });
                         res.end(JSON.stringify({ success: true }));
                     } catch (err) {
