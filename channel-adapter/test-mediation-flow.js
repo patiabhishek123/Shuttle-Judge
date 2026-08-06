@@ -18,9 +18,13 @@ async function run() {
     try {
         console.log("=== STARTING DYNAMIC SHUTTLE COURT MEDIATION FLOW TEST ===");
 
+        const testId = Date.now();
+        const convA = `conv_party_a_${testId}`;
+        const convB = `conv_party_b_${testId}`;
+
         // --- PARTY A INTAKE ---
         let reply = await sendMsg(
-            'conv_party_a', 
+            convA, 
             'party_a@example.com', 
             'I want to open a case about our electricity bill from March. I paid $340 but the other party refuses to pay their half.'
         );
@@ -38,18 +42,18 @@ async function run() {
         while (attempts < 5) {
             attempts++;
             if (reply.includes("is that right?") || reply.includes("is this correct?")) {
-                reply = await sendMsg('conv_party_a', 'party_a@example.com', 'Yes, that is correct.');
+                reply = await sendMsg(convA, 'party_a@example.com', 'Yes, that is correct.');
                 break;
             } else if (reply.includes("waiting for the other party to join")) {
                 break;
             } else {
-                reply = await sendMsg('conv_party_a', 'party_a@example.com', 'I paid $340 on March 15 for electricity. I want them to pay half ($170).');
+                reply = await sendMsg(convA, 'party_a@example.com', 'I paid $340 on March 15 for electricity. I want them to pay half ($170).');
             }
         }
 
         // --- PARTY B JOINS ---
         reply = await sendMsg(
-            'conv_party_b',
+            convB,
             'party_b@example.com',
             joinCode
         );
@@ -63,30 +67,30 @@ async function run() {
                 console.log(">>> Proposal received by Party B!");
                 break;
             } else if (reply.includes("is that right?") || reply.includes("is this correct?")) {
-                reply = await sendMsg('conv_party_b', 'party_b@example.com', 'Yes, that is correct.');
+                reply = await sendMsg(convB, 'party_b@example.com', 'Yes, that is correct.');
             } else if (reply.includes("double check") || reply.includes("receipt") || reply.includes("exactly") || reply.includes("amount") || reply.includes("Who paid")) {
                 if (!contradictionResolved) {
-                    reply = await sendMsg('conv_party_b', 'party_b@example.com', 'Ah, sorry, looking at the bill statement again, it was indeed $340. I was looking at the February one.');
+                    reply = await sendMsg(convB, 'party_b@example.com', 'Ah, sorry, looking at the bill statement again, it was indeed $340. I was looking at the February one.');
                     contradictionResolved = true;
                 } else {
-                    reply = await sendMsg('conv_party_b', 'party_b@example.com', 'It was definitely $340.');
+                    reply = await sendMsg(convB, 'party_b@example.com', 'It was definitely $340.');
                 }
             } else {
-                reply = await sendMsg('conv_party_b', 'party_b@example.com', 'I paid $150 for March electricity. The bill was actually $300 total.');
+                reply = await sendMsg(convB, 'party_b@example.com', 'I paid $150 for March electricity. The bill was actually $300 total.');
             }
         }
 
         // --- CONSENT PHASE ---
         // A votes YES
         reply = await sendMsg(
-            'conv_party_a',
+            convA,
             'party_a@example.com',
             'YES'
         );
 
         // B votes YES
         reply = await sendMsg(
-            'conv_party_b',
+            convB,
             'party_b@example.com',
             'YES'
         );
