@@ -1,0 +1,4 @@
+.env
+shuttle_court_engine
+node_modules/
+channel-adapter/node_modules/
