@@ -984,7 +984,12 @@ Respond strictly in JSON:
 }
 
 func generateClarifyingQuestion(ctx context.Context, cfg *Config, caseID, partyID string, tx pgx.Tx) (string, error) {
-	claims, err := loadClaims(ctx, tx, caseID, "")
+	var role string
+	err := tx.QueryRow(ctx, "SELECT role FROM parties WHERE id = $1", partyID).Scan(&role)
+	if err != nil {
+		return "", err
+	}
+	claims, err := loadClaims(ctx, tx, caseID, role)
 	if err != nil {
 		return "", err
 	}
@@ -1011,7 +1016,12 @@ Respond strictly in JSON:
 }
 
 func generateRestatement(ctx context.Context, cfg *Config, caseID, partyID string, tx pgx.Tx) (string, error) {
-	claims, err := loadClaims(ctx, tx, caseID, "")
+	var role string
+	err := tx.QueryRow(ctx, "SELECT role FROM parties WHERE id = $1", partyID).Scan(&role)
+	if err != nil {
+		return "", err
+	}
+	claims, err := loadClaims(ctx, tx, caseID, role)
 	if err != nil {
 		return "", err
 	}
@@ -1074,6 +1084,11 @@ func callOpenRouterJSON(ctx context.Context, cfg *Config, systemPrompt, userProm
 		return fmt.Errorf("openrouter API error (status %d): %s", resp.StatusCode, string(errBody))
 	}
 
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+
 	var openRouterResponse struct {
 		Choices []struct {
 			Message struct {
@@ -1082,12 +1097,13 @@ func callOpenRouterJSON(ctx context.Context, cfg *Config, systemPrompt, userProm
 		} `json:"choices"`
 	}
 
-	if err := json.NewDecoder(resp.Body).Decode(&openRouterResponse); err != nil {
-		return err
+	if err := json.Unmarshal(respBody, &openRouterResponse); err != nil {
+		log.Printf("OpenRouter raw response body: %s", string(respBody))
+		return fmt.Errorf("failed to unmarshal OpenRouter response: %w (raw response: %s)", err, string(respBody))
 	}
 
 	if len(openRouterResponse.Choices) == 0 {
-		return fmt.Errorf("empty response choices from OpenRouter")
+		return fmt.Errorf("empty response choices from OpenRouter (raw response: %s)", string(respBody))
 	}
 
 	contentStr := openRouterResponse.Choices[0].Message.Content
