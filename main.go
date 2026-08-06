@@ -1064,67 +1064,87 @@ func callOpenRouterJSON(ctx context.Context, cfg *Config, systemPrompt, userProm
 		return err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", "https://openrouter.ai/api/v1/chat/completions", bytes.NewBuffer(bodyBytes))
-	if err != nil {
-		return err
+	var lastErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		if attempt > 1 {
+			log.Printf("[OpenRouter] Attempt %d failed. Retrying in %d ms...", attempt-1, attempt*300)
+			time.Sleep(time.Duration(attempt) * 300 * time.Millisecond)
+		}
+
+		req, err := http.NewRequestWithContext(ctx, "POST", "https://openrouter.ai/api/v1/chat/completions", bytes.NewBuffer(bodyBytes))
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		req.Header.Set("Authorization", "Bearer "+cfg.OpenRouterAPIKey)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("HTTP-Referer", "http://localhost:8080")
+		req.Header.Set("X-Title", "Shuttle Court")
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		if resp.StatusCode >= 400 {
+			errBody, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			lastErr = fmt.Errorf("openrouter API error (status %d): %s", resp.StatusCode, string(errBody))
+			continue
+		}
+
+		respBody, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		var openRouterResponse struct {
+			Choices []struct {
+				Message struct {
+					Content string `json:"content"`
+				} `json:"message"`
+			} `json:"choices"`
+		}
+
+		if err := json.Unmarshal(respBody, &openRouterResponse); err != nil {
+			log.Printf("OpenRouter raw response body: %s", string(respBody))
+			lastErr = fmt.Errorf("failed to unmarshal OpenRouter response: %w (raw response: %s)", err, string(respBody))
+			continue
+		}
+
+		if len(openRouterResponse.Choices) == 0 {
+			lastErr = fmt.Errorf("empty response choices from OpenRouter (raw response: %s)", string(respBody))
+			continue
+		}
+
+		contentStr := openRouterResponse.Choices[0].Message.Content
+
+		// Clean markdown JSON wrapping if present
+		cleaned := strings.TrimSpace(contentStr)
+		if strings.HasPrefix(cleaned, "```json") {
+			cleaned = strings.TrimPrefix(cleaned, "```json")
+			cleaned = strings.TrimSuffix(cleaned, "```")
+		} else if strings.HasPrefix(cleaned, "```") {
+			cleaned = strings.TrimPrefix(cleaned, "```")
+			cleaned = strings.TrimSuffix(cleaned, "```")
+		}
+		cleaned = strings.TrimSpace(cleaned)
+
+		if err := json.Unmarshal([]byte(cleaned), result); err != nil {
+			log.Printf("Failed to unmarshal model content on attempt %d: %s", attempt, contentStr)
+			lastErr = fmt.Errorf("failed to unmarshal model content: %w (raw content: %q, cleaned: %q)", err, contentStr, cleaned)
+			continue
+		}
+
+		// Success!
+		return nil
 	}
 
-	req.Header.Set("Authorization", "Bearer "+cfg.OpenRouterAPIKey)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("HTTP-Referer", "http://localhost:8080")
-	req.Header.Set("X-Title", "Shuttle Court")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		errBody, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("openrouter API error (status %d): %s", resp.StatusCode, string(errBody))
-	}
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
-
-	var openRouterResponse struct {
-		Choices []struct {
-			Message struct {
-				Content string `json:"content"`
-			} `json:"message"`
-		} `json:"choices"`
-	}
-
-	if err := json.Unmarshal(respBody, &openRouterResponse); err != nil {
-		log.Printf("OpenRouter raw response body: %s", string(respBody))
-		return fmt.Errorf("failed to unmarshal OpenRouter response: %w (raw response: %s)", err, string(respBody))
-	}
-
-	if len(openRouterResponse.Choices) == 0 {
-		return fmt.Errorf("empty response choices from OpenRouter (raw response: %s)", string(respBody))
-	}
-
-	contentStr := openRouterResponse.Choices[0].Message.Content
-	
-	// Clean markdown JSON wrapping if present
-	cleaned := strings.TrimSpace(contentStr)
-	if strings.HasPrefix(cleaned, "```json") {
-		cleaned = strings.TrimPrefix(cleaned, "```json")
-		cleaned = strings.TrimSuffix(cleaned, "```")
-	} else if strings.HasPrefix(cleaned, "```") {
-		cleaned = strings.TrimPrefix(cleaned, "```")
-		cleaned = strings.TrimSuffix(cleaned, "```")
-	}
-	cleaned = strings.TrimSpace(cleaned)
-
-	if err := json.Unmarshal([]byte(cleaned), result); err != nil {
-		log.Printf("Failed to unmarshal model content: %s", contentStr)
-		return fmt.Errorf("failed to unmarshal model content: %w (raw content: %q, cleaned: %q)", err, contentStr, cleaned)
-	}
-	return nil
+	return fmt.Errorf("all OpenRouter attempts failed. Last error: %w", lastErr)
 }
 
 // --- Database Helper Functions ---
