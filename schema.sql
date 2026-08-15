@@ -20,7 +20,8 @@ CREATE TABLE cases (
     cross_check_rounds_b SMALLINT NOT NULL DEFAULT 0,
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
-    resolved_at       TIMESTAMPTZ
+    resolved_at       TIMESTAMPTZ,
+    delivery_issue    TEXT
 );
 
 -- =========================================================
@@ -72,6 +73,7 @@ CREATE TABLE consents (
     party_id         UUID NOT NULL REFERENCES parties(id) ON DELETE CASCADE,
     decision         VARCHAR(10) NOT NULL CHECK (decision IN ('yes','no')),
     comment          TEXT,                 -- only ever shown back to the SAME party, never the counterpart
+    objection_claim_ids JSONB NOT NULL DEFAULT '[]',
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (proposal_id, party_id)
 );

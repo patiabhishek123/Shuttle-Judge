@@ -24,10 +24,14 @@ import (
 
 // Config holds environment configurations
 type Config struct {
-	DatabaseURL      string
-	OpenRouterAPIKey string
-	OpenRouterModel  string
-	Port             string
+	DatabaseURL           string
+	OpenRouterAPIKey      string
+	OpenRouterModel       string
+	Port                  string
+	EngineToken           string
+	AdapterToken          string
+	CaseLogConversationID string
+	InactivityTimeout     time.Duration
 }
 
 // MessageRequest is the incoming payload from the Node.js channel-adapter
@@ -73,9 +77,9 @@ type ConsentResult struct {
 }
 
 type ClaimRecord struct {
-	ClaimType  string
-	ValueText  string
-	Confidence string
+	ClaimType  string `json:"claim_type"`
+	ValueText  string `json:"value_text"`
+	Confidence string `json:"confidence"`
 }
 
 type ReplyDecision int
@@ -93,17 +97,26 @@ func main() {
 	}
 
 	config := &Config{
-		DatabaseURL:      os.Getenv("DATABASE_URL"),
-		OpenRouterAPIKey: os.Getenv("OPENROUTER_API_KEY"),
-		OpenRouterModel:  os.Getenv("OPENROUTER_MODEL"),
-		Port:             os.Getenv("PORT"),
+		DatabaseURL:           os.Getenv("DATABASE_URL"),
+		OpenRouterAPIKey:      os.Getenv("OPENROUTER_API_KEY"),
+		OpenRouterModel:       os.Getenv("OPENROUTER_MODEL"),
+		Port:                  os.Getenv("PORT"),
+		EngineToken:           os.Getenv("ENGINE_TOKEN"),
+		AdapterToken:          os.Getenv("ADAPTER_TOKEN"),
+		CaseLogConversationID: os.Getenv("CASE_LOG_CONVERSATION_ID"),
+		InactivityTimeout:     30 * time.Minute,
 	}
 
 	if config.Port == "" {
 		config.Port = "8080"
 	}
 	if config.OpenRouterModel == "" {
-		config.OpenRouterModel = "google/gemini-2.5-flash"
+		config.OpenRouterModel = "anthropic/claude-3.5-haiku"
+	}
+	if raw := os.Getenv("INACTIVITY_TIMEOUT"); raw != "" {
+		if parsed, err := time.ParseDuration(raw); err == nil && parsed > 0 {
+			config.InactivityTimeout = parsed
+		}
 	}
 
 	if config.DatabaseURL == "" || config.OpenRouterAPIKey == "" {
@@ -127,6 +140,7 @@ func main() {
 	}
 	log.Println("Database connection established successfully")
 	go runOutboxWorker(ctx, pool)
+	go runInactivityWorker(ctx, pool, config.InactivityTimeout)
 
 	// Set up router
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -139,14 +153,26 @@ func main() {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-
-		var req MessageRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "Bad request", http.StatusBadRequest)
+		if config.EngineToken != "" && r.Header.Get("Authorization") != "Bearer "+config.EngineToken {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
 
-		log.Printf("[Inbound] Chan: %s | Conv: %s | Sender: %s | Msg: %q\n", req.Channel, req.ConversationID, req.SenderRef, req.Text)
+		var req MessageRequest
+		r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
+		decoder := json.NewDecoder(r.Body)
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&req); err != nil {
+			http.Error(w, "Bad request", http.StatusBadRequest)
+			return
+		}
+		if strings.TrimSpace(req.ConversationID) == "" || strings.TrimSpace(req.Channel) == "" || strings.TrimSpace(req.Text) == "" ||
+			(req.Channel != "email" && req.Channel != "slack" && req.Channel != "telegram") {
+			http.Error(w, "Missing or invalid message fields", http.StatusBadRequest)
+			return
+		}
+
+		log.Printf("[Inbound] channel=%s conversation=%s bytes=%d", req.Channel, redactIdentifier(req.ConversationID), len(req.Text))
 
 		reply, err := processMessage(ctx, pool, config, req)
 		if err != nil {
@@ -159,8 +185,9 @@ func main() {
 		json.NewEncoder(w).Encode(MessageResponse{ReplyText: reply})
 	})
 
+	server := &http.Server{Addr: ":" + config.Port, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
 	log.Printf("Go mediation engine listening on port %s...\n", config.Port)
-	if err := http.ListenAndServe(":"+config.Port, nil); err != nil {
+	if err := server.ListenAndServe(); err != nil {
 		log.Fatalf("Server failed to start: %v\n", err)
 	}
 }
@@ -195,7 +222,8 @@ func processMessage(ctx context.Context, pool *pgxpool.Pool, cfg *Config, req Me
 				err := tx.QueryRow(ctx, `
 					SELECT id, status, topic_summary 
 					FROM cases 
-					WHERE join_code = $1 AND join_code_used_at IS NULL`,
+					WHERE join_code = $1 AND join_code_used_at IS NULL AND status = 'AWAITING_JOIN'
+					FOR UPDATE`,
 					cleanText).Scan(&unusedCaseID, &caseStatus, &topicSummary)
 
 				if err == nil {
@@ -236,7 +264,7 @@ func processMessage(ctx context.Context, pool *pgxpool.Pool, cfg *Config, req Me
 						return "", err
 					}
 
-					reply := fmt.Sprintf("Welcome to Shuttle Court. You have joined the case regarding: \"%s\". To help me mediate, please tell me your side of the story: what happened, what amount/date is in dispute, and what outcome you want.", topicSummary)
+					reply := fmt.Sprintf("Welcome to Shuttle Court. You joined a case regarding %s. What happened from your perspective?", topicSummary)
 
 					// Log outbound message
 					_, err = tx.Exec(ctx, `
@@ -254,7 +282,11 @@ func processMessage(ctx context.Context, pool *pgxpool.Pool, cfg *Config, req Me
 				}
 			}
 
-			// Not a join code, or join code not found. Create a new case (Party A intake start).
+			if isJoinCode {
+				return "That join code is invalid, expired, or not ready yet. Please check the code and try again.", nil
+			}
+
+			// Not a join attempt. Extract substantive claims before opening a case.
 			llmRes, err := extractClaims(ctx, cfg, req.Text)
 			if err != nil {
 				return "", err
@@ -266,15 +298,11 @@ func processMessage(ctx context.Context, pool *pgxpool.Pool, cfg *Config, req Me
 			if llmRes.IsInsult {
 				return "I can only carry substantive claims, not insults. Please describe your disagreement using checkable facts.", nil
 			}
+			if len(llmRes.Claims) == 0 {
+				return "I can help mediate an everyday interpersonal or financial disagreement. Tell me briefly what the dispute is about.", nil
+			}
 
-			newCaseID := generateUUID()
-			shortID := generateCode(6)
-			joinCode := generateCode(6)
-
-			_, err = tx.Exec(ctx, `
-				INSERT INTO cases (id, short_id, join_code, status, topic_summary, cross_check_rounds) 
-				VALUES ($1, $2, $3, 'INTAKE', '', 0)`,
-				newCaseID, shortID, joinCode)
+			newCaseID, shortID, joinCode, err := insertCaseWithUniqueCodes(ctx, tx)
 			if err != nil {
 				return "", err
 			}
@@ -317,7 +345,7 @@ func processMessage(ctx context.Context, pool *pgxpool.Pool, cfg *Config, req Me
 				}
 			}
 
-			reply := fmt.Sprintf("Hello, I am Docket, your Shuttle Court mediator. I have opened case **%s** for you. Please share this join code with the other party: **%s**. They can message me with this code to join.\n\nI have recorded your initial details. Let's make sure I have everything: what exactly happened, what amount or date is in dispute, and what resolution do you want?", shortID, joinCode)
+			reply := fmt.Sprintf("Hello, I am Docket, your Shuttle Court mediator. I have opened case **%s**. Share join code **%s** with the other party. What outcome would you like from mediation?", shortID, joinCode)
 
 			// Log outbound message
 			_, err = tx.Exec(ctx, `
@@ -337,12 +365,12 @@ func processMessage(ctx context.Context, pool *pgxpool.Pool, cfg *Config, req Me
 	}
 
 	// Link exists. Load case status & role
-	var shortID, joinCode, status, topicSummary string
+	var shortID, joinCode, status, topicSummary, deliveryIssue string
 	var crossCheckRounds int
 	err = tx.QueryRow(ctx, `
-		SELECT short_id, join_code, status, topic_summary, cross_check_rounds 
-		FROM cases WHERE id = $1`,
-		caseID).Scan(&shortID, &joinCode, &status, &topicSummary, &crossCheckRounds)
+		SELECT short_id, join_code, status, topic_summary, cross_check_rounds, COALESCE(delivery_issue, '')
+		FROM cases WHERE id = $1 FOR UPDATE`,
+		caseID).Scan(&shortID, &joinCode, &status, &topicSummary, &crossCheckRounds, &deliveryIssue)
 	if err != nil {
 		return "", err
 	}
@@ -364,8 +392,23 @@ func processMessage(ctx context.Context, pool *pgxpool.Pool, cfg *Config, req Me
 		return "", err
 	}
 
-	// Handle status query shortcut
-	if strings.Contains(strings.ToLower(req.Text), "status") {
+	if isCounterpartWordsQuery(req.Text) {
+		reply := "I can’t share the other party’s words. I can share only the neutral substance of the disagreement"
+		if strings.TrimSpace(topicSummary) != "" {
+			reply += ": " + strings.TrimSpace(topicSummary)
+		}
+		reply += "."
+		if err := logOutbound(ctx, tx, caseID, partyID, req.Channel, reply); err != nil {
+			return "", err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return "", err
+		}
+		return reply, nil
+	}
+
+	// Handle explicit status queries only.
+	if isStatusQuery(req.Text) {
 		var reply string
 		switch status {
 		case "INTAKE":
@@ -387,12 +430,13 @@ func processMessage(ctx context.Context, pool *pgxpool.Pool, cfg *Config, req Me
 		case "STALLED":
 			reply = "This mediation has stalled."
 		}
+		if deliveryIssue != "" {
+			reply += " A message delivery problem also needs attention."
+		}
 
-		// Log outbound message
-		_, _ = tx.Exec(ctx, `
-			INSERT INTO messages_log (id, case_id, party_id, direction, channel, raw_text) 
-			VALUES ($1, $2, $3, 'out', $4, $5)`,
-			generateUUID(), caseID, partyID, req.Channel, reply)
+		if err := logOutbound(ctx, tx, caseID, partyID, req.Channel, reply); err != nil {
+			return "", err
+		}
 
 		if err := tx.Commit(ctx); err != nil {
 			return "", err
@@ -565,7 +609,10 @@ func processMessage(ctx context.Context, pool *pgxpool.Pool, cfg *Config, req Me
 
 	case "AWAITING_CONSENT":
 		// This party responded to the proposal. Evaluate consent.
-		replyText, err = handleConsentEvaluation(ctx, tx, cfg, caseID, partyID, req.Text)
+		replyText, err = handleConsentEvaluation(ctx, tx, cfg, caseID, partyID, msgID, req.Text)
+
+	case "PROPOSE":
+		replyText = "I am preparing the resolution proposal. I will send it when it is ready."
 
 	default:
 		replyText = "Mediation for this case has ended."
@@ -650,7 +697,9 @@ func stallCrossCheck(ctx context.Context, tx pgx.Tx, caseID, currentPartyID stri
 		return "", err
 	}
 	role := "A"
-	_ = tx.QueryRow(ctx, `SELECT role FROM parties WHERE id = $1`, currentPartyID).Scan(&role)
+	if err := tx.QueryRow(ctx, `SELECT role FROM parties WHERE id = $1`, currentPartyID).Scan(&role); err != nil {
+		return "", err
+	}
 	counterpartRole := "B"
 	if role == "B" {
 		counterpartRole = "A"
@@ -678,6 +727,10 @@ func initiateProposal(ctx context.Context, tx pgx.Tx, cfg *Config, caseID, curre
 	// Load claims
 	claimsA, _ := loadClaims(ctx, tx, caseID, "A")
 	claimsB, _ := loadClaims(ctx, tx, caseID, "B")
+	claimsSnapshot, err := buildClaimsSnapshot(ctx, tx, caseID)
+	if err != nil {
+		return "", err
+	}
 
 	systemPrompt := `You are Docket, the Shuttle Court AI mediator.
 You are generating a resolution proposal based on these reconciled claims:
@@ -707,8 +760,8 @@ Respond strictly in JSON format matching this schema:
 	proposalID := generateUUID()
 	_, err = tx.Exec(ctx, `
 		INSERT INTO proposals (id, case_id, version, proposal_text, generated_from) 
-		VALUES ($1, $2, 1, $3, '{}')`,
-		proposalID, caseID, res.ProposalText)
+		VALUES ($1, $2, 1, $3, $4)`,
+		proposalID, caseID, res.ProposalText, claimsSnapshot)
 	if err != nil {
 		return "", err
 	}
@@ -724,7 +777,9 @@ Respond strictly in JSON format matching this schema:
 	// Send proposal proactively to counterpart
 	counterpartRole := "B"
 	var currentPartyRole string
-	_ = tx.QueryRow(ctx, "SELECT role FROM parties WHERE id = $1", currentPartyID).Scan(&currentPartyRole)
+	if err := tx.QueryRow(ctx, "SELECT role FROM parties WHERE id = $1", currentPartyID).Scan(&currentPartyRole); err != nil {
+		return "", err
+	}
 	if currentPartyRole == "B" {
 		counterpartRole = "A"
 	}
@@ -742,7 +797,7 @@ Respond strictly in JSON format matching this schema:
 }
 
 // handleConsentEvaluation processes the user's vote on the proposal
-func handleConsentEvaluation(ctx context.Context, tx pgx.Tx, cfg *Config, caseID, currentPartyID, userText string) (string, error) {
+func handleConsentEvaluation(ctx context.Context, tx pgx.Tx, cfg *Config, caseID, currentPartyID, sourceMessageID, userText string) (string, error) {
 	// Load latest proposal
 	var proposalID string
 	var proposalText string
@@ -756,7 +811,6 @@ func handleConsentEvaluation(ctx context.Context, tx pgx.Tx, cfg *Config, caseID
 	if err != nil {
 		return "", err
 	}
-
 	decision := classifyReplyDecision(userText)
 	if decision == DecisionUnknown {
 		return "Please reply YES to accept the proposal, or NO followed by your concern.", nil
@@ -777,6 +831,14 @@ func handleConsentEvaluation(ctx context.Context, tx pgx.Tx, cfg *Config, caseID
 		consentID, proposalID, currentPartyID, res.Consent, res.Comment)
 	if err != nil {
 		return "", err
+	}
+	if res.Consent == "no" {
+		_, err = tx.Exec(ctx, `UPDATE consents SET objection_claim_ids = COALESCE((
+			SELECT jsonb_agg(id) FROM claims WHERE source_message_id = $2
+		), '[]'::jsonb) WHERE proposal_id = $1 AND party_id = $3`, proposalID, sourceMessageID, currentPartyID)
+		if err != nil {
+			return "", err
+		}
 	}
 
 	// Check if both consented
@@ -802,7 +864,9 @@ func handleConsentEvaluation(ctx context.Context, tx pgx.Tx, cfg *Config, caseID
 
 		// Proactively notify counterpart
 		var currentPartyRole string
-		_ = tx.QueryRow(ctx, "SELECT role FROM parties WHERE id = $1", currentPartyID).Scan(&currentPartyRole)
+		if err := tx.QueryRow(ctx, "SELECT role FROM parties WHERE id = $1", currentPartyID).Scan(&currentPartyRole); err != nil {
+			return "", err
+		}
 		counterpartRole := "B"
 		if currentPartyRole == "B" {
 			counterpartRole = "A"
@@ -815,8 +879,12 @@ func handleConsentEvaluation(ctx context.Context, tx pgx.Tx, cfg *Config, caseID
 			}
 		}
 
-		// Dispatch final summary to third-party log channel
-		go dispatchCaseSummary(cfg, caseID, proposalText)
+		if cfg.CaseLogConversationID != "" {
+			summary := fmt.Sprintf("SHUTTLE COURT CASE RESOLUTION LOG\nCase ID: %s\n\nProposal Accepted:\n%s", caseID, proposalText)
+			if err := enqueueProactiveMessage(ctx, tx, caseID, currentPartyID, cfg.CaseLogConversationID, "email", summary); err != nil {
+				return "", err
+			}
+		}
 
 		return "Excellent. Both parties have consented. This case is now resolved. Thank you for using Shuttle Court.", nil
 	}
@@ -834,7 +902,9 @@ func handleConsentEvaluation(ctx context.Context, tx pgx.Tx, cfg *Config, caseID
 
 			// Proactively notify counterpart
 			var currentPartyRole string
-			_ = tx.QueryRow(ctx, "SELECT role FROM parties WHERE id = $1", currentPartyID).Scan(&currentPartyRole)
+			if err := tx.QueryRow(ctx, "SELECT role FROM parties WHERE id = $1", currentPartyID).Scan(&currentPartyRole); err != nil {
+				return "", err
+			}
 			counterpartRole := "B"
 			if currentPartyRole == "B" {
 				counterpartRole = "A"
@@ -853,6 +923,10 @@ func handleConsentEvaluation(ctx context.Context, tx pgx.Tx, cfg *Config, caseID
 		// Create a revised proposal
 		claimsA, _ := loadClaims(ctx, tx, caseID, "A")
 		claimsB, _ := loadClaims(ctx, tx, caseID, "B")
+		claimsSnapshot, err := buildClaimsSnapshot(ctx, tx, caseID)
+		if err != nil {
+			return "", err
+		}
 
 		objectionPrompt := `You are Docket, the Shuttle Court AI mediator.
 Generate a revised proposal using only the structured claims below. One party raised a concern, which has already been converted into these claims. Never infer or reproduce private source wording.
@@ -882,15 +956,17 @@ Respond strictly in JSON format matching this schema:
 		newProposalID := generateUUID()
 		_, err = tx.Exec(ctx, `
 			INSERT INTO proposals (id, case_id, version, proposal_text, generated_from) 
-			VALUES ($1, $2, $3, $4, '{}')`,
-			newProposalID, caseID, version+1, newRes.ProposalText)
+			VALUES ($1, $2, $3, $4, $5)`,
+			newProposalID, caseID, version+1, newRes.ProposalText, claimsSnapshot)
 		if err != nil {
 			return "", err
 		}
 
 		// Proactively notify counterpart (without leaking raw objection text)
 		var currentPartyRole string
-		_ = tx.QueryRow(ctx, "SELECT role FROM parties WHERE id = $1", currentPartyID).Scan(&currentPartyRole)
+		if err := tx.QueryRow(ctx, "SELECT role FROM parties WHERE id = $1", currentPartyID).Scan(&currentPartyRole); err != nil {
+			return "", err
+		}
 		counterpartRole := "B"
 		if currentPartyRole == "B" {
 			counterpartRole = "A"
@@ -908,19 +984,6 @@ Respond strictly in JSON format matching this schema:
 
 	// Just recorded a YES consent, waiting for the other party
 	return "Thank you for your response. I am waiting for the other party to vote on the proposal.", nil
-}
-
-// dispatchCaseSummary dispatches a clean log summary to a third-party email channel
-func dispatchCaseSummary(cfg *Config, caseID, proposalText string) {
-	log.Println("[Summary Dispatch] Sending final resolution summary to case log channel...")
-
-	// Proactively post a summary email using Caspian client
-	logAddress := "shuttlecourt-log@agents.trycaspianai.com"
-	summaryText := fmt.Sprintf("SHUTTLE COURT CASE RESOLUTION LOG\nCase ID: %s\nResolved At: %s\n\nProposal Accepted:\n%s", caseID, time.Now().Format(time.RFC1123), proposalText)
-
-	// Create a mock conversation/channel send or initiate email connection
-	// We can use the proactive send to a special log channel, or simply log it.
-	log.Printf("[Case Log Email Sent to %s]: %s\n", logAddress, summaryText)
 }
 
 // --- LLM client functions ---
@@ -1092,16 +1155,16 @@ func callOpenRouterJSON(ctx context.Context, cfg *Config, systemPrompt, userProm
 		req.Header.Set("HTTP-Referer", "http://localhost:8080")
 		req.Header.Set("X-Title", "Shuttle Court")
 
-		resp, err := http.DefaultClient.Do(req)
+		client := &http.Client{Timeout: 30 * time.Second}
+		resp, err := client.Do(req)
 		if err != nil {
 			lastErr = err
 			continue
 		}
 
 		if resp.StatusCode >= 400 {
-			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
-			lastErr = fmt.Errorf("openrouter API error (status %d): %s", resp.StatusCode, string(errBody))
+			lastErr = fmt.Errorf("openrouter API error (status %d)", resp.StatusCode)
 			continue
 		}
 
@@ -1121,13 +1184,12 @@ func callOpenRouterJSON(ctx context.Context, cfg *Config, systemPrompt, userProm
 		}
 
 		if err := json.Unmarshal(respBody, &openRouterResponse); err != nil {
-			log.Printf("OpenRouter raw response body: %s", string(respBody))
-			lastErr = fmt.Errorf("failed to unmarshal OpenRouter response: %w (raw response: %s)", err, string(respBody))
+			lastErr = fmt.Errorf("failed to decode OpenRouter response: %w", err)
 			continue
 		}
 
 		if len(openRouterResponse.Choices) == 0 {
-			lastErr = fmt.Errorf("empty response choices from OpenRouter (raw response: %s)", string(respBody))
+			lastErr = errors.New("empty response choices from OpenRouter")
 			continue
 		}
 
@@ -1145,8 +1207,8 @@ func callOpenRouterJSON(ctx context.Context, cfg *Config, systemPrompt, userProm
 		cleaned = strings.TrimSpace(cleaned)
 
 		if err := json.Unmarshal([]byte(cleaned), result); err != nil {
-			log.Printf("Failed to unmarshal model content on attempt %d: %s", attempt, contentStr)
-			lastErr = fmt.Errorf("failed to unmarshal model content: %w (raw content: %q, cleaned: %q)", err, contentStr, cleaned)
+			log.Printf("Failed to decode model JSON on attempt %d", attempt)
+			lastErr = fmt.Errorf("failed to decode model JSON: %w", err)
 			continue
 		}
 
@@ -1211,6 +1273,67 @@ func loadClaimRecords(ctx context.Context, tx pgx.Tx, caseID, role string) ([]Cl
 		result = append(result, claim)
 	}
 	return result, rows.Err()
+}
+
+func buildClaimsSnapshot(ctx context.Context, tx pgx.Tx, caseID string) ([]byte, error) {
+	a, err := loadClaimRecords(ctx, tx, caseID, "A")
+	if err != nil {
+		return nil, err
+	}
+	b, err := loadClaimRecords(ctx, tx, caseID, "B")
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(map[string][]ClaimRecord{"party_a": a, "party_b": b})
+}
+
+func insertCaseWithUniqueCodes(ctx context.Context, tx pgx.Tx) (caseID, shortID, joinCode string, err error) {
+	for attempt := 0; attempt < 8; attempt++ {
+		caseID, shortID, joinCode = generateUUID(), generateCode(6), generateCode(6)
+		err = tx.QueryRow(ctx, `INSERT INTO cases (id, short_id, join_code, status, topic_summary, cross_check_rounds)
+			VALUES ($1, $2, $3, 'INTAKE', '', 0) ON CONFLICT DO NOTHING RETURNING id`, caseID, shortID, joinCode).Scan(&caseID)
+		if err == nil {
+			return caseID, shortID, joinCode, nil
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return "", "", "", err
+		}
+	}
+	return "", "", "", errors.New("could not allocate unique case codes")
+}
+
+func isStatusQuery(text string) bool {
+	normalized := strings.Trim(strings.ToLower(strings.TrimSpace(text)), "?.! ")
+	switch normalized {
+	case "status", "case status", "what is the status", "what's the status", "where are we", "any update", "any updates":
+		return true
+	default:
+		return false
+	}
+}
+
+func isCounterpartWordsQuery(text string) bool {
+	normalized := strings.ToLower(text)
+	patterns := []string{"what did they say", "what did the other party say", "show me their message", "send me their message", "quote them"}
+	for _, pattern := range patterns {
+		if strings.Contains(normalized, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+func redactIdentifier(value string) string {
+	if len(value) <= 8 {
+		return "[redacted]"
+	}
+	return value[:4] + "…" + value[len(value)-4:]
+}
+
+func logOutbound(ctx context.Context, tx pgx.Tx, caseID, partyID, channel, messageText string) error {
+	_, err := tx.Exec(ctx, `INSERT INTO messages_log (id, case_id, party_id, direction, channel, raw_text)
+		VALUES ($1, $2, $3, 'out', $4, $5)`, generateUUID(), caseID, partyID, channel, messageText)
+	return err
 }
 
 func classifyReplyDecision(text string) ReplyDecision {
@@ -1323,6 +1446,9 @@ func sendProactiveMessage(ctx context.Context, conversationID, text string) erro
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if token := os.Getenv("ADAPTER_TOKEN"); token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
@@ -1365,12 +1491,75 @@ func runOutboxWorker(ctx context.Context, pool *pgxpool.Pool) {
 	}
 }
 
+func runInactivityWorker(ctx context.Context, pool *pgxpool.Pool, timeout time.Duration) {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := stallOneInactiveCase(ctx, pool, timeout); err != nil {
+				log.Printf("Inactivity worker error: %v", err)
+			}
+		}
+	}
+}
+
+func stallOneInactiveCase(ctx context.Context, pool *pgxpool.Pool, timeout time.Duration) error {
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	var caseID string
+	err = tx.QueryRow(ctx, `SELECT id FROM cases
+		WHERE status NOT IN ('RESOLVED','STALLED') AND updated_at < NOW() - $1::interval
+		ORDER BY updated_at FOR UPDATE SKIP LOCKED LIMIT 1`, timeout.String()).Scan(&caseID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if _, err = tx.Exec(ctx, `UPDATE cases SET status = 'STALLED', updated_at = NOW() WHERE id = $1`, caseID); err != nil {
+		return err
+	}
+	rows, err := tx.Query(ctx, `SELECT p.id, cl.conversation_id, cl.channel FROM parties p
+		JOIN conversation_links cl ON cl.party_id = p.id WHERE p.case_id = $1`, caseID)
+	if err != nil {
+		return err
+	}
+	type destination struct{ partyID, conversationID, channel string }
+	var destinations []destination
+	for rows.Next() {
+		var d destination
+		if err := rows.Scan(&d.partyID, &d.conversationID, &d.channel); err != nil {
+			rows.Close()
+			return err
+		}
+		destinations = append(destinations, d)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	for _, d := range destinations {
+		msg := "Mediation has stalled because the case was inactive beyond the response deadline."
+		if err := enqueueProactiveMessage(ctx, tx, caseID, d.partyID, d.conversationID, d.channel, msg); err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
+}
+
 func deliverOneOutboxMessage(ctx context.Context, pool *pgxpool.Pool) error {
-	var id, conversationID, messageText string
+	var id, caseID, conversationID, messageText string
 	err := pool.QueryRow(ctx, `
 		UPDATE outbound_messages SET status = 'processing', attempts = attempts + 1
 		WHERE id = (SELECT id FROM outbound_messages WHERE status IN ('pending','failed') AND attempts < 5 ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1)
-		RETURNING id, conversation_id, text`).Scan(&id, &conversationID, &messageText)
+		RETURNING id, case_id, conversation_id, text`).Scan(&id, &caseID, &conversationID, &messageText)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil
 	}
@@ -1382,6 +1571,9 @@ func deliverOneOutboxMessage(ctx context.Context, pool *pgxpool.Pool) error {
 		if updateErr != nil {
 			return updateErr
 		}
+		if _, issueErr := pool.Exec(ctx, `UPDATE cases SET delivery_issue = CASE WHEN (SELECT attempts FROM outbound_messages WHERE id = $2) >= 5 THEN $3 ELSE delivery_issue END WHERE id = $1`, caseID, id, "Proactive message delivery failed after five attempts"); issueErr != nil {
+			return issueErr
+		}
 		return err
 	}
 	_, err = pool.Exec(ctx, `UPDATE outbound_messages SET status = 'sent', sent_at = NOW(), last_error = NULL WHERE id = $1`, id)
@@ -1392,6 +1584,8 @@ func ensureRuntimeSchema(ctx context.Context, pool *pgxpool.Pool) error {
 	statements := []string{
 		`ALTER TABLE cases ADD COLUMN IF NOT EXISTS cross_check_rounds_a SMALLINT NOT NULL DEFAULT 0`,
 		`ALTER TABLE cases ADD COLUMN IF NOT EXISTS cross_check_rounds_b SMALLINT NOT NULL DEFAULT 0`,
+		`ALTER TABLE cases ADD COLUMN IF NOT EXISTS delivery_issue TEXT`,
+		`ALTER TABLE consents ADD COLUMN IF NOT EXISTS objection_claim_ids JSONB NOT NULL DEFAULT '[]'`,
 		`CREATE TABLE IF NOT EXISTS outbound_messages (
 			id UUID PRIMARY KEY DEFAULT gen_random_uuid(), case_id UUID NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
 			party_id UUID NOT NULL REFERENCES parties(id) ON DELETE CASCADE, conversation_id VARCHAR(255) NOT NULL,

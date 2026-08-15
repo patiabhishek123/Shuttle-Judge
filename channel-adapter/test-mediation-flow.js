@@ -87,6 +87,9 @@ async function run() {
             'party_a@example.com',
             'YES'
         );
+		if (!reply.toLowerCase().includes('resolved')) {
+			throw new Error(`Expected final RESOLVED confirmation, received: ${reply}`);
+		}
 
         // B votes YES
         reply = await sendMsg(
@@ -101,6 +104,7 @@ async function run() {
         if (e.response && e.response.data) {
             console.error("Backend error details:", e.response.data);
         }
+		process.exitCode = 1;
     }
 }
 

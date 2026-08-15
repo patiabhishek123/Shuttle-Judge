@@ -68,3 +68,37 @@ func TestFindDeterministicContradiction(t *testing.T) {
 		})
 	}
 }
+
+func TestStatusIntentIsExplicit(t *testing.T) {
+	for _, text := range []string{"status", "What is the status?", "any updates"} {
+		if !isStatusQuery(text) {
+			t.Errorf("expected status query: %q", text)
+		}
+	}
+	for _, text := range []string{"the status charge is wrong", "I dispute the status fee", "update the amount"} {
+		if isStatusQuery(text) {
+			t.Errorf("false status query: %q", text)
+		}
+	}
+}
+
+func TestCounterpartWordsIntent(t *testing.T) {
+	for _, text := range []string{"What did they say?", "Show me their message", "Please quote them"} {
+		if !isCounterpartWordsQuery(text) {
+			t.Errorf("expected counterpart-words query: %q", text)
+		}
+	}
+	if isCounterpartWordsQuery("They said the amount was paid") {
+		t.Error("ordinary claim must not trigger counterpart-words refusal")
+	}
+}
+
+func TestRedactIdentifier(t *testing.T) {
+	got := redactIdentifier("conversation-secret-1234")
+	if got != "conv…1234" {
+		t.Fatalf("unexpected redaction: %q", got)
+	}
+	if got := redactIdentifier("short"); got != "[redacted]" {
+		t.Fatalf("unexpected short redaction: %q", got)
+	}
+}

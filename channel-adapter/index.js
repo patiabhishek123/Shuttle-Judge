@@ -60,7 +60,7 @@ async function main() {
             console.log(`ID: ${message.id}`);
             console.log(`Channel: ${message.channel}`);
             console.log(`Conv ID: ${message.conversationId}`);
-            console.log(`Text: "${message.text}"`);
+            console.log(`Text bytes: ${Buffer.byteLength(message.text || '', 'utf8')}`);
             
             // Format a simple sender reference string for the backend
             let senderRef = 'unknown';
@@ -79,6 +79,9 @@ async function main() {
                     channel: message.channel,
                     text: message.text || '',
                     sender_ref: senderRef
+                }, {
+                    timeout: 30000,
+                    headers: process.env.ENGINE_TOKEN ? { Authorization: `Bearer ${process.env.ENGINE_TOKEN}` } : {}
                 });
 
                 const replyText = response.data.reply_text || '';
@@ -99,9 +102,25 @@ async function main() {
         const http = require('http');
         const proactiveServer = http.createServer((req, res) => {
             if (req.method === 'POST' && req.url === '/send') {
+                if (process.env.ADAPTER_TOKEN && req.headers.authorization !== `Bearer ${process.env.ADAPTER_TOKEN}`) {
+                    res.writeHead(401, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ error: 'Unauthorized' }));
+                    return;
+                }
                 let body = '';
-                req.on('data', chunk => { body += chunk; });
+                let tooLarge = false;
+                req.on('data', chunk => {
+                    if (!tooLarge) body += chunk;
+                    if (Buffer.byteLength(body, 'utf8') > 65536) {
+                        tooLarge = true;
+                    }
+                });
                 req.on('end', async () => {
+                    if (tooLarge) {
+                        res.writeHead(413, { 'Content-Type': 'application/json' });
+                        res.end(JSON.stringify({ error: 'Payload too large' }));
+                        return;
+                    }
                     try {
                         const payload = JSON.parse(body);
                         const { conversation_id, text } = payload;
@@ -110,7 +129,7 @@ async function main() {
                             res.end(JSON.stringify({ error: 'Missing conversation_id or text' }));
                             return;
                         }
-                        console.log(`[Proactive] Sending to ${conversation_id}: "${text}"`);
+                        console.log(`[Proactive] Sending to conversation ending ${String(conversation_id).slice(-4)} (${Buffer.byteLength(text, 'utf8')} bytes)`);
                         if (conversation_id.startsWith('conv_')) {
                             console.log(`[Proactive] Mock conversation detected. Simulating send success.`);
                         } else {

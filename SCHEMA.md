@@ -20,10 +20,13 @@ CREATE TABLE cases (
                           'INTAKE','AWAITING_JOIN','INTAKE_B','CROSS_CHECK',
                           'PROPOSE','AWAITING_CONSENT','RESOLVED','STALLED'
                         )),
-    cross_check_rounds SMALLINT NOT NULL DEFAULT 0,        -- bounds the clarify loop, see DESIGN.md §4
+    cross_check_rounds SMALLINT NOT NULL DEFAULT 0,
+    cross_check_rounds_a SMALLINT NOT NULL DEFAULT 0,
+    cross_check_rounds_b SMALLINT NOT NULL DEFAULT 0,
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
-    resolved_at       TIMESTAMPTZ
+    resolved_at       TIMESTAMPTZ,
+    delivery_issue    TEXT
 );
 
 -- =========================================================
@@ -92,6 +95,7 @@ CREATE TABLE consents (
     party_id         UUID NOT NULL REFERENCES parties(id) ON DELETE CASCADE,
     decision         VARCHAR(10) NOT NULL CHECK (decision IN ('yes','no')),
     comment          TEXT,                 -- only ever shown back to the SAME party, never the counterpart
+    objection_claim_ids JSONB NOT NULL DEFAULT '[]',
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (proposal_id, party_id)
 );
@@ -112,6 +116,7 @@ CREATE INDEX idx_messages_log_case ON messages_log (case_id, created_at);
 ```
 
 ## Notes
+- `outbound_messages` in `schema.sql` is the transactional delivery outbox. It commits proactive delivery intent with case state and retries delivery asynchronously.
 - `claims.source_message_id` references `messages_log` — declare `messages_log` before `claims` in real migration order, or defer the FK (shown out of creation-order above for readability; migration file should create `messages_log` first).
 - No `users` table on purpose — identity is entirely `(conversation_id, channel)` scoped through `conversation_links`. This matches AGENTS.md's non-goal of persistent accounts.
 - `parties.display_ref` is intentionally opaque — do not store phone numbers/emails in plaintext beyond what's operationally needed to reply via Caspian (Caspian itself owns the actual channel address).
