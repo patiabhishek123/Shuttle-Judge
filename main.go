@@ -12,6 +12,8 @@ import (
 	"math/big"
 	"net/http"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -70,6 +72,20 @@ type ConsentResult struct {
 	Comment string `json:"comment"`
 }
 
+type ClaimRecord struct {
+	ClaimType  string
+	ValueText  string
+	Confidence string
+}
+
+type ReplyDecision int
+
+const (
+	DecisionUnknown ReplyDecision = iota
+	DecisionYes
+	DecisionNo
+)
+
 func main() {
 	// Load .env file
 	if err := godotenv.Load(); err != nil {
@@ -106,7 +122,11 @@ func main() {
 	if err := pool.Ping(ctx); err != nil {
 		log.Fatalf("Database ping failed: %v\n", err)
 	}
+	if err := ensureRuntimeSchema(ctx, pool); err != nil {
+		log.Fatalf("Database migration failed: %v\n", err)
+	}
 	log.Println("Database connection established successfully")
+	go runOutboxWorker(ctx, pool)
 
 	// Set up router
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -160,7 +180,7 @@ func processMessage(ctx context.Context, pool *pgxpool.Pool, cfg *Config, req Me
 	err = tx.QueryRow(ctx, `
 		SELECT case_id, party_id 
 		FROM conversation_links 
-		WHERE conversation_id = $1 AND channel = $2`, 
+		WHERE conversation_id = $1 AND channel = $2`,
 		req.ConversationID, req.Channel).Scan(&caseID, &partyID)
 
 	if err != nil {
@@ -175,7 +195,7 @@ func processMessage(ctx context.Context, pool *pgxpool.Pool, cfg *Config, req Me
 				err := tx.QueryRow(ctx, `
 					SELECT id, status, topic_summary 
 					FROM cases 
-					WHERE join_code = $1 AND join_code_used_at IS NULL`, 
+					WHERE join_code = $1 AND join_code_used_at IS NULL`,
 					cleanText).Scan(&unusedCaseID, &caseStatus, &topicSummary)
 
 				if err == nil {
@@ -183,7 +203,7 @@ func processMessage(ctx context.Context, pool *pgxpool.Pool, cfg *Config, req Me
 					newPartyID := generateUUID()
 					_, err = tx.Exec(ctx, `
 						INSERT INTO parties (id, case_id, role, display_ref) 
-						VALUES ($1, $2, 'B', $3)`, 
+						VALUES ($1, $2, 'B', $3)`,
 						newPartyID, unusedCaseID, req.SenderRef)
 					if err != nil {
 						return "", err
@@ -191,7 +211,7 @@ func processMessage(ctx context.Context, pool *pgxpool.Pool, cfg *Config, req Me
 
 					_, err = tx.Exec(ctx, `
 						INSERT INTO conversation_links (id, conversation_id, channel, case_id, party_id) 
-						VALUES ($1, $2, $3, $4, $5)`, 
+						VALUES ($1, $2, $3, $4, $5)`,
 						generateUUID(), req.ConversationID, req.Channel, unusedCaseID, newPartyID)
 					if err != nil {
 						return "", err
@@ -200,7 +220,7 @@ func processMessage(ctx context.Context, pool *pgxpool.Pool, cfg *Config, req Me
 					_, err = tx.Exec(ctx, `
 						UPDATE cases 
 						SET status = 'INTAKE_B', join_code_used_at = NOW(), updated_at = NOW() 
-						WHERE id = $1`, 
+						WHERE id = $1`,
 						unusedCaseID)
 					if err != nil {
 						return "", err
@@ -210,7 +230,7 @@ func processMessage(ctx context.Context, pool *pgxpool.Pool, cfg *Config, req Me
 					msgID := generateUUID()
 					_, err = tx.Exec(ctx, `
 						INSERT INTO messages_log (id, case_id, party_id, direction, channel, raw_text) 
-						VALUES ($1, $2, $3, 'in', $4, $5)`, 
+						VALUES ($1, $2, $3, 'in', $4, $5)`,
 						msgID, unusedCaseID, newPartyID, req.Channel, req.Text)
 					if err != nil {
 						return "", err
@@ -221,7 +241,7 @@ func processMessage(ctx context.Context, pool *pgxpool.Pool, cfg *Config, req Me
 					// Log outbound message
 					_, err = tx.Exec(ctx, `
 						INSERT INTO messages_log (id, case_id, party_id, direction, channel, raw_text) 
-						VALUES ($1, $2, $3, 'out', $4, $5)`, 
+						VALUES ($1, $2, $3, 'out', $4, $5)`,
 						generateUUID(), unusedCaseID, newPartyID, req.Channel, reply)
 					if err != nil {
 						return "", err
@@ -253,7 +273,7 @@ func processMessage(ctx context.Context, pool *pgxpool.Pool, cfg *Config, req Me
 
 			_, err = tx.Exec(ctx, `
 				INSERT INTO cases (id, short_id, join_code, status, topic_summary, cross_check_rounds) 
-				VALUES ($1, $2, $3, 'INTAKE', '', 0)`, 
+				VALUES ($1, $2, $3, 'INTAKE', '', 0)`,
 				newCaseID, shortID, joinCode)
 			if err != nil {
 				return "", err
@@ -262,7 +282,7 @@ func processMessage(ctx context.Context, pool *pgxpool.Pool, cfg *Config, req Me
 			newPartyID := generateUUID()
 			_, err = tx.Exec(ctx, `
 				INSERT INTO parties (id, case_id, role, display_ref) 
-				VALUES ($1, $2, 'A', $3)`, 
+				VALUES ($1, $2, 'A', $3)`,
 				newPartyID, newCaseID, req.SenderRef)
 			if err != nil {
 				return "", err
@@ -270,7 +290,7 @@ func processMessage(ctx context.Context, pool *pgxpool.Pool, cfg *Config, req Me
 
 			_, err = tx.Exec(ctx, `
 				INSERT INTO conversation_links (id, conversation_id, channel, case_id, party_id) 
-				VALUES ($1, $2, $3, $4, $5)`, 
+				VALUES ($1, $2, $3, $4, $5)`,
 				generateUUID(), req.ConversationID, req.Channel, newCaseID, newPartyID)
 			if err != nil {
 				return "", err
@@ -280,7 +300,7 @@ func processMessage(ctx context.Context, pool *pgxpool.Pool, cfg *Config, req Me
 			msgID := generateUUID()
 			_, err = tx.Exec(ctx, `
 				INSERT INTO messages_log (id, case_id, party_id, direction, channel, raw_text) 
-				VALUES ($1, $2, $3, 'in', $4, $5)`, 
+				VALUES ($1, $2, $3, 'in', $4, $5)`,
 				msgID, newCaseID, newPartyID, req.Channel, req.Text)
 			if err != nil {
 				return "", err
@@ -290,7 +310,7 @@ func processMessage(ctx context.Context, pool *pgxpool.Pool, cfg *Config, req Me
 			for _, claim := range llmRes.Claims {
 				_, err = tx.Exec(ctx, `
 					INSERT INTO claims (id, case_id, party_id, claim_type, value_text, confidence, source_message_id) 
-					VALUES ($1, $2, $3, $4, $5, $6, $7)`, 
+					VALUES ($1, $2, $3, $4, $5, $6, $7)`,
 					generateUUID(), newCaseID, newPartyID, claim.ClaimType, claim.ValueText, claim.Confidence, msgID)
 				if err != nil {
 					return "", err
@@ -302,7 +322,7 @@ func processMessage(ctx context.Context, pool *pgxpool.Pool, cfg *Config, req Me
 			// Log outbound message
 			_, err = tx.Exec(ctx, `
 				INSERT INTO messages_log (id, case_id, party_id, direction, channel, raw_text) 
-				VALUES ($1, $2, $3, 'out', $4, $5)`, 
+				VALUES ($1, $2, $3, 'out', $4, $5)`,
 				generateUUID(), newCaseID, newPartyID, req.Channel, reply)
 			if err != nil {
 				return "", err
@@ -321,14 +341,14 @@ func processMessage(ctx context.Context, pool *pgxpool.Pool, cfg *Config, req Me
 	var crossCheckRounds int
 	err = tx.QueryRow(ctx, `
 		SELECT short_id, join_code, status, topic_summary, cross_check_rounds 
-		FROM cases WHERE id = $1`, 
+		FROM cases WHERE id = $1`,
 		caseID).Scan(&shortID, &joinCode, &status, &topicSummary, &crossCheckRounds)
 	if err != nil {
 		return "", err
 	}
 
 	err = tx.QueryRow(ctx, `
-		SELECT role FROM parties WHERE id = $1`, 
+		SELECT role FROM parties WHERE id = $1`,
 		partyID).Scan(&partyRole)
 	if err != nil {
 		return "", err
@@ -338,7 +358,7 @@ func processMessage(ctx context.Context, pool *pgxpool.Pool, cfg *Config, req Me
 	msgID := generateUUID()
 	_, err = tx.Exec(ctx, `
 		INSERT INTO messages_log (id, case_id, party_id, direction, channel, raw_text) 
-		VALUES ($1, $2, $3, 'in', $4, $5)`, 
+		VALUES ($1, $2, $3, 'in', $4, $5)`,
 		msgID, caseID, partyID, req.Channel, req.Text)
 	if err != nil {
 		return "", err
@@ -371,7 +391,7 @@ func processMessage(ctx context.Context, pool *pgxpool.Pool, cfg *Config, req Me
 		// Log outbound message
 		_, _ = tx.Exec(ctx, `
 			INSERT INTO messages_log (id, case_id, party_id, direction, channel, raw_text) 
-			VALUES ($1, $2, $3, 'out', $4, $5)`, 
+			VALUES ($1, $2, $3, 'out', $4, $5)`,
 			generateUUID(), caseID, partyID, req.Channel, reply)
 
 		if err := tx.Commit(ctx); err != nil {
@@ -393,15 +413,20 @@ func processMessage(ctx context.Context, pool *pgxpool.Pool, cfg *Config, req Me
 		return "I can only carry substantive claims, not insults. Please describe your disagreement using checkable facts.", nil
 	}
 
-	// Save claims (overwrite existing claims of that type for the party to keep current)
+	// Replace each affected claim type once, preserving multiple values of the
+	// same type extracted from one message (for example total and share amounts).
+	deletedTypes := make(map[string]bool)
 	for _, claim := range llmRes.Claims {
-		_, _ = tx.Exec(ctx, `
-			DELETE FROM claims WHERE case_id = $1 AND party_id = $2 AND claim_type = $3`, 
-			caseID, partyID, claim.ClaimType)
-		
+		if !deletedTypes[claim.ClaimType] {
+			if _, err = tx.Exec(ctx, `DELETE FROM claims WHERE case_id = $1 AND party_id = $2 AND claim_type = $3`, caseID, partyID, claim.ClaimType); err != nil {
+				return "", err
+			}
+			deletedTypes[claim.ClaimType] = true
+		}
+
 		_, err = tx.Exec(ctx, `
 			INSERT INTO claims (id, case_id, party_id, claim_type, value_text, confidence, source_message_id) 
-			VALUES ($1, $2, $3, $4, $5, $6, $7)`, 
+			VALUES ($1, $2, $3, $4, $5, $6, $7)`,
 			generateUUID(), caseID, partyID, claim.ClaimType, claim.ValueText, claim.Confidence, msgID)
 		if err != nil {
 			return "", err
@@ -418,12 +443,21 @@ func processMessage(ctx context.Context, pool *pgxpool.Pool, cfg *Config, req Me
 		err = tx.QueryRow(ctx, `
 			SELECT raw_text FROM messages_log 
 			WHERE case_id = $1 AND party_id = $2 AND direction = 'out' 
-			ORDER BY created_at DESC LIMIT 1`, 
+			ORDER BY created_at DESC LIMIT 1`,
 			caseID, partyID).Scan(&lastOutboundText)
 
 		isReplyingToRestatement := err == nil && (strings.Contains(lastOutboundText, "is that right?") || strings.Contains(lastOutboundText, "is this correct?"))
 
 		if isReplyingToRestatement {
+			decision := classifyReplyDecision(req.Text)
+			if decision != DecisionYes {
+				if decision == DecisionNo {
+					replyText = "What should I correct in that summary?"
+				} else {
+					replyText = "Please reply YES if that summary is correct, or NO if it needs correction."
+				}
+				break
+			}
 			// A has confirmed claims. Generate neutral topic summary
 			topic, err := generateTopicSummary(ctx, cfg, caseID, partyID, tx)
 			if err != nil {
@@ -433,7 +467,7 @@ func processMessage(ctx context.Context, pool *pgxpool.Pool, cfg *Config, req Me
 			_, err = tx.Exec(ctx, `
 				UPDATE cases 
 				SET status = 'AWAITING_JOIN', topic_summary = $2, updated_at = NOW() 
-				WHERE id = $1`, 
+				WHERE id = $1`,
 				caseID, topic)
 			if err != nil {
 				return "", err
@@ -477,15 +511,24 @@ func processMessage(ctx context.Context, pool *pgxpool.Pool, cfg *Config, req Me
 		err = tx.QueryRow(ctx, `
 			SELECT raw_text FROM messages_log 
 			WHERE case_id = $1 AND party_id = $2 AND direction = 'out' 
-			ORDER BY created_at DESC LIMIT 1`, 
+			ORDER BY created_at DESC LIMIT 1`,
 			caseID, partyID).Scan(&lastOutboundText)
 
 		isReplyingToRestatement := err == nil && (strings.Contains(lastOutboundText, "is that right?") || strings.Contains(lastOutboundText, "is this correct?"))
 
 		if isReplyingToRestatement {
+			decision := classifyReplyDecision(req.Text)
+			if decision != DecisionYes {
+				if decision == DecisionNo {
+					replyText = "What should I correct in that summary?"
+				} else {
+					replyText = "Please reply YES if that summary is correct, or NO if it needs correction."
+				}
+				break
+			}
 			// B confirmed! Move to CROSS_CHECK and immediately perform cross-check
 			_, err = tx.Exec(ctx, `
-				UPDATE cases SET status = 'CROSS_CHECK', updated_at = NOW() WHERE id = $1`, 
+				UPDATE cases SET status = 'CROSS_CHECK', updated_at = NOW() WHERE id = $1`,
 				caseID)
 			if err != nil {
 				return "", err
@@ -535,7 +578,7 @@ func processMessage(ctx context.Context, pool *pgxpool.Pool, cfg *Config, req Me
 	// Log outbound response
 	_, err = tx.Exec(ctx, `
 		INSERT INTO messages_log (id, case_id, party_id, direction, channel, raw_text) 
-		VALUES ($1, $2, $3, 'out', $4, $5)`, 
+		VALUES ($1, $2, $3, 'out', $4, $5)`,
 		generateUUID(), caseID, partyID, req.Channel, replyText)
 	if err != nil {
 		return "", err
@@ -550,93 +593,83 @@ func processMessage(ctx context.Context, pool *pgxpool.Pool, cfg *Config, req Me
 
 // runCrossCheckFlow performs claims comparison and manages contradictions
 func runCrossCheckFlow(ctx context.Context, tx pgx.Tx, cfg *Config, caseID, currentPartyID string) (string, error) {
-	// Increment rounds
-	var rounds int
-	err := tx.QueryRow(ctx, `
-		UPDATE cases 
-		SET cross_check_rounds = cross_check_rounds + 1, updated_at = NOW() 
-		WHERE id = $1 
-		RETURNING cross_check_rounds`, 
-		caseID).Scan(&rounds)
+	claimsA, err := loadClaimRecords(ctx, tx, caseID, "A")
 	if err != nil {
 		return "", err
 	}
-
-	// Load claims of both parties
-	claimsA, err := loadClaims(ctx, tx, caseID, "A")
+	claimsB, err := loadClaimRecords(ctx, tx, caseID, "B")
 	if err != nil {
 		return "", err
 	}
-	claimsB, err := loadClaims(ctx, tx, caseID, "B")
-	if err != nil {
-		return "", err
-	}
-
-	// Call LLM to detect contradictions and get a targeted follow-up question
-	systemPrompt := `You are Docket, the Shuttle Court AI mediator.
-You are comparing claims between Party A and Party B.
-Here are the claims of both parties:
-Party A:
-` + claimsA + `
-
-Party B:
-` + claimsB + `
-
-Your goal is to detect contradiction in 'amount' or 'date'.
-If they differ:
-Determine which party has a more vague claim (lower confidence). Ask them a targeted follow-up question.
-Do NOT reveal the counterpart's raw text or exact values, e.g. do not say "The other party says $340". Just ask them to clarify, e.g. "Can you double check the amount of the March bill?"
-If there are no contradictions, or if both parties match, set target_role to "" and question_text to "OK".
-
-Respond strictly in JSON format matching this schema:
-{
-  "target_role": "A" | "B" | "",
-  "question_text": "question text or OK"
-}`
-
-	var res CrossCheckResult
-	err = callOpenRouterJSON(ctx, cfg, systemPrompt, "Analyze and cross-check these claims", &res)
-	if err != nil {
-		return "", err
-	}
-
-	// If no contradictions or rounds limit hit (rounds > 2) -> Propose resolution
-	if res.TargetRole == "" || res.QuestionText == "OK" || rounds > 2 {
+	targetRole, claimType := findDeterministicContradiction(claimsA, claimsB)
+	if targetRole == "" {
 		return initiateProposal(ctx, tx, cfg, caseID, currentPartyID)
 	}
 
+	column := "cross_check_rounds_a"
+	if targetRole == "B" {
+		column = "cross_check_rounds_b"
+	}
+	var rounds int
+	err = tx.QueryRow(ctx, fmt.Sprintf(`
+		UPDATE cases SET cross_check_rounds = cross_check_rounds + 1,
+		%s = %s + 1, updated_at = NOW()
+		WHERE id = $1 RETURNING %s`, column, column, column), caseID).Scan(&rounds)
+	if err != nil {
+		return "", err
+	}
+	if rounds > 2 {
+		return stallCrossCheck(ctx, tx, caseID, currentPartyID)
+	}
+
+	questionText := "Can you confirm the exact date involved in the dispute?"
+	if claimType == "amount" {
+		questionText = "Can you double-check and confirm the exact amount involved?"
+	}
+
 	// We have a targeted follow-up question
-	targetPartyID, targetConvID, targetChannel, err := getPartyDetailsByRole(ctx, tx, caseID, res.TargetRole)
+	targetPartyID, targetConvID, targetChannel, err := getPartyDetailsByRole(ctx, tx, caseID, targetRole)
 	if err != nil {
 		return "", err
 	}
 
 	if targetPartyID == currentPartyID {
-		// Ask the current user directly
-		return res.QuestionText, nil
+		return questionText, nil
 	}
 
-	// Proactively ask the counterpart
-	err = sendProactiveMessage(ctx, targetConvID, res.QuestionText)
-	if err != nil {
-		log.Printf("Failed to send proactive message to %s: %v\n", targetConvID, err)
-	} else {
-		// Log the proactive question
-		_, _ = tx.Exec(ctx, `
-			INSERT INTO messages_log (id, case_id, party_id, direction, channel, raw_text) 
-			VALUES ($1, $2, $3, 'out', $4, $5)`, 
-			generateUUID(), caseID, targetPartyID, targetChannel, res.QuestionText)
+	if err := enqueueProactiveMessage(ctx, tx, caseID, targetPartyID, targetConvID, targetChannel, questionText); err != nil {
+		return "", err
 	}
 
 	// Reply to current user that we are cross-checking
 	return "Thank you. I am cross-checking details with the other party to clarify some points. I will notify you once done.", nil
 }
 
+func stallCrossCheck(ctx context.Context, tx pgx.Tx, caseID, currentPartyID string) (string, error) {
+	if _, err := tx.Exec(ctx, `UPDATE cases SET status = 'STALLED', updated_at = NOW() WHERE id = $1`, caseID); err != nil {
+		return "", err
+	}
+	role := "A"
+	_ = tx.QueryRow(ctx, `SELECT role FROM parties WHERE id = $1`, currentPartyID).Scan(&role)
+	counterpartRole := "B"
+	if role == "B" {
+		counterpartRole = "A"
+	}
+	partyID, convID, channel, err := getPartyDetailsByRole(ctx, tx, caseID, counterpartRole)
+	if err == nil {
+		msg := "Mediation has stalled because the conflicting details could not be reconciled within the clarification limit."
+		if err := enqueueProactiveMessage(ctx, tx, caseID, partyID, convID, channel, msg); err != nil {
+			return "", err
+		}
+	}
+	return "Mediation has stalled because the conflicting details could not be reconciled within the clarification limit.", nil
+}
+
 // initiateProposal generates a resolution proposal and sends to both
 func initiateProposal(ctx context.Context, tx pgx.Tx, cfg *Config, caseID, currentPartyID string) (string, error) {
 	// Transition cases to PROPOSE
 	_, err := tx.Exec(ctx, `
-		UPDATE cases SET status = 'PROPOSE', updated_at = NOW() WHERE id = $1`, 
+		UPDATE cases SET status = 'PROPOSE', updated_at = NOW() WHERE id = $1`,
 		caseID)
 	if err != nil {
 		return "", err
@@ -674,7 +707,7 @@ Respond strictly in JSON format matching this schema:
 	proposalID := generateUUID()
 	_, err = tx.Exec(ctx, `
 		INSERT INTO proposals (id, case_id, version, proposal_text, generated_from) 
-		VALUES ($1, $2, 1, $3, '{}')`, 
+		VALUES ($1, $2, 1, $3, '{}')`,
 		proposalID, caseID, res.ProposalText)
 	if err != nil {
 		return "", err
@@ -682,7 +715,7 @@ Respond strictly in JSON format matching this schema:
 
 	// Transition case to AWAITING_CONSENT
 	_, err = tx.Exec(ctx, `
-		UPDATE cases SET status = 'AWAITING_CONSENT', updated_at = NOW() WHERE id = $1`, 
+		UPDATE cases SET status = 'AWAITING_CONSENT', updated_at = NOW() WHERE id = $1`,
 		caseID)
 	if err != nil {
 		return "", err
@@ -699,14 +732,8 @@ Respond strictly in JSON format matching this schema:
 	cPartyID, cConvID, cChannel, err := getPartyDetailsByRole(ctx, tx, caseID, counterpartRole)
 	if err == nil {
 		proposalMsg := fmt.Sprintf("I have formulated a resolution proposal:\n\n%s\n\nDo you accept this proposal? Please reply YES or NO.", res.ProposalText)
-		err = sendProactiveMessage(ctx, cConvID, proposalMsg)
-		if err != nil {
-			log.Printf("Failed to send proposal proactively to counterpart: %v\n", err)
-		} else {
-			_, _ = tx.Exec(ctx, `
-				INSERT INTO messages_log (id, case_id, party_id, direction, channel, raw_text) 
-				VALUES ($1, $2, $3, 'out', $4, $5)`, 
-				generateUUID(), caseID, cPartyID, cChannel, proposalMsg)
+		if err := enqueueProactiveMessage(ctx, tx, caseID, cPartyID, cConvID, cChannel, proposalMsg); err != nil {
+			return "", err
 		}
 	}
 
@@ -724,31 +751,20 @@ func handleConsentEvaluation(ctx context.Context, tx pgx.Tx, cfg *Config, caseID
 		SELECT id, proposal_text, version 
 		FROM proposals 
 		WHERE case_id = $1 
-		ORDER BY version DESC LIMIT 1`, 
+		ORDER BY version DESC LIMIT 1`,
 		caseID).Scan(&proposalID, &proposalText, &version)
 	if err != nil {
 		return "", err
 	}
 
-	// Classify response
-	systemPrompt := `You are Docket, the Shuttle Court AI mediator.
-Evaluate the user's reply to this proposal:
-Proposal: "` + proposalText + `"
-User Reply: "` + userText + `"
-
-Determine if they accept (yes) or reject (no).
-If they reject, extract their specific objection, comment, or concern.
-
-Respond strictly in JSON format matching this schema:
-{
-  "consent": "yes" | "no",
-  "comment": "objection detail or empty string"
-}`
-
-	var res ConsentResult
-	err = callOpenRouterJSON(ctx, cfg, systemPrompt, "Classify consent", &res)
-	if err != nil {
-		return "", err
+	decision := classifyReplyDecision(userText)
+	if decision == DecisionUnknown {
+		return "Please reply YES to accept the proposal, or NO followed by your concern.", nil
+	}
+	res := ConsentResult{Consent: "yes"}
+	if decision == DecisionNo {
+		res.Consent = "no"
+		res.Comment = strings.TrimSpace(userText)
 	}
 
 	// Record consent
@@ -757,7 +773,7 @@ Respond strictly in JSON format matching this schema:
 		INSERT INTO consents (id, proposal_id, party_id, decision, comment) 
 		VALUES ($1, $2, $3, $4, $5) 
 		ON CONFLICT (proposal_id, party_id) DO UPDATE 
-		SET decision = EXCLUDED.decision, comment = EXCLUDED.comment`, 
+		SET decision = EXCLUDED.decision, comment = EXCLUDED.comment`,
 		consentID, proposalID, currentPartyID, res.Consent, res.Comment)
 	if err != nil {
 		return "", err
@@ -767,7 +783,7 @@ Respond strictly in JSON format matching this schema:
 	var consentsCount int
 	err = tx.QueryRow(ctx, `
 		SELECT COUNT(*) FROM consents 
-		WHERE proposal_id = $1 AND decision = 'yes'`, 
+		WHERE proposal_id = $1 AND decision = 'yes'`,
 		proposalID).Scan(&consentsCount)
 	if err != nil {
 		return "", err
@@ -778,7 +794,7 @@ Respond strictly in JSON format matching this schema:
 		_, err = tx.Exec(ctx, `
 			UPDATE cases 
 			SET status = 'RESOLVED', resolved_at = NOW(), updated_at = NOW() 
-			WHERE id = $1`, 
+			WHERE id = $1`,
 			caseID)
 		if err != nil {
 			return "", err
@@ -794,11 +810,9 @@ Respond strictly in JSON format matching this schema:
 		cPartyID, cConvID, cChannel, err := getPartyDetailsByRole(ctx, tx, caseID, counterpartRole)
 		if err == nil {
 			msg := "Excellent. Both parties have consented. This case is now resolved. Thank you for using Shuttle Court."
-			_ = sendProactiveMessage(ctx, cConvID, msg)
-			_, _ = tx.Exec(ctx, `
-				INSERT INTO messages_log (id, case_id, party_id, direction, channel, raw_text) 
-				VALUES ($1, $2, $3, 'out', $4, $5)`, 
-				generateUUID(), caseID, cPartyID, cChannel, msg)
+			if err := enqueueProactiveMessage(ctx, tx, caseID, cPartyID, cConvID, cChannel, msg); err != nil {
+				return "", err
+			}
 		}
 
 		// Dispatch final summary to third-party log channel
@@ -812,7 +826,7 @@ Respond strictly in JSON format matching this schema:
 		if version >= 3 {
 			// Stall the case
 			_, err = tx.Exec(ctx, `
-				UPDATE cases SET status = 'STALLED', updated_at = NOW() WHERE id = $1`, 
+				UPDATE cases SET status = 'STALLED', updated_at = NOW() WHERE id = $1`,
 				caseID)
 			if err != nil {
 				return "", err
@@ -828,11 +842,9 @@ Respond strictly in JSON format matching this schema:
 			cPartyID, cConvID, cChannel, err := getPartyDetailsByRole(ctx, tx, caseID, counterpartRole)
 			if err == nil {
 				msg := "Mediation has stalled because we could not reach an agreement."
-				_ = sendProactiveMessage(ctx, cConvID, msg)
-				_, _ = tx.Exec(ctx, `
-					INSERT INTO messages_log (id, case_id, party_id, direction, channel, raw_text) 
-					VALUES ($1, $2, $3, 'out', $4, $5)`, 
-					generateUUID(), caseID, cPartyID, cChannel, msg)
+				if err := enqueueProactiveMessage(ctx, tx, caseID, cPartyID, cConvID, cChannel, msg); err != nil {
+					return "", err
+				}
 			}
 
 			return "Mediation has stalled because we could not reach an agreement.", nil
@@ -843,9 +855,9 @@ Respond strictly in JSON format matching this schema:
 		claimsB, _ := loadClaims(ctx, tx, caseID, "B")
 
 		objectionPrompt := `You are Docket, the Shuttle Court AI mediator.
-You proposed: "` + proposalText + `"
-One of the parties rejected it with the following objection: "` + res.Comment + `"
-Based on the reconciled claims of the parties:
+Generate a revised proposal using only the structured claims below. One party raised a concern, which has already been converted into these claims. Never infer or reproduce private source wording.
+Previous proposal: "` + proposalText + `"
+Structured claims:
 Party A:
 ` + claimsA + `
 
@@ -870,7 +882,7 @@ Respond strictly in JSON format matching this schema:
 		newProposalID := generateUUID()
 		_, err = tx.Exec(ctx, `
 			INSERT INTO proposals (id, case_id, version, proposal_text, generated_from) 
-			VALUES ($1, $2, $3, $4, '{}')`, 
+			VALUES ($1, $2, $3, $4, '{}')`,
 			newProposalID, caseID, version+1, newRes.ProposalText)
 		if err != nil {
 			return "", err
@@ -886,11 +898,9 @@ Respond strictly in JSON format matching this schema:
 		cPartyID, cConvID, cChannel, err := getPartyDetailsByRole(ctx, tx, caseID, counterpartRole)
 		if err == nil {
 			revisedMsg := fmt.Sprintf("The other party had a concern about the proposal. Here is a revised version:\n\n%s\n\nDo you accept this revised proposal? Please reply YES or NO.", newRes.ProposalText)
-			_ = sendProactiveMessage(ctx, cConvID, revisedMsg)
-			_, _ = tx.Exec(ctx, `
-				INSERT INTO messages_log (id, case_id, party_id, direction, channel, raw_text) 
-				VALUES ($1, $2, $3, 'out', $4, $5)`, 
-				generateUUID(), caseID, cPartyID, cChannel, revisedMsg)
+			if err := enqueueProactiveMessage(ctx, tx, caseID, cPartyID, cConvID, cChannel, revisedMsg); err != nil {
+				return "", err
+			}
 		}
 
 		return fmt.Sprintf("I have formulated a revised proposal to address concerns:\n\n%s\n\nDo you accept this revised proposal? Please reply YES or NO.", newRes.ProposalText), nil
@@ -907,7 +917,7 @@ func dispatchCaseSummary(cfg *Config, caseID, proposalText string) {
 	// Proactively post a summary email using Caspian client
 	logAddress := "shuttlecourt-log@agents.trycaspianai.com"
 	summaryText := fmt.Sprintf("SHUTTLE COURT CASE RESOLUTION LOG\nCase ID: %s\nResolved At: %s\n\nProposal Accepted:\n%s", caseID, time.Now().Format(time.RFC1123), proposalText)
-	
+
 	// Create a mock conversation/channel send or initiate email connection
 	// We can use the proactive send to a special log channel, or simply log it.
 	log.Printf("[Case Log Email Sent to %s]: %s\n", logAddress, summaryText)
@@ -1157,13 +1167,13 @@ func loadClaims(ctx context.Context, tx pgx.Tx, caseID, roleFilter string) (stri
 			SELECT c.claim_type, c.value_text, c.confidence 
 			FROM claims c
 			JOIN parties p ON c.party_id = p.id
-			WHERE c.case_id = $1 AND p.role = $2`, 
+			WHERE c.case_id = $1 AND p.role = $2`,
 			caseID, roleFilter)
 	} else {
 		rows, err = tx.Query(ctx, `
 			SELECT claim_type, value_text, confidence 
 			FROM claims 
-			WHERE case_id = $1`, 
+			WHERE case_id = $1`,
 			caseID)
 	}
 	if err != nil {
@@ -1182,12 +1192,117 @@ func loadClaims(ctx context.Context, tx pgx.Tx, caseID, roleFilter string) (stri
 	return sb.String(), nil
 }
 
+func loadClaimRecords(ctx context.Context, tx pgx.Tx, caseID, role string) ([]ClaimRecord, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT c.claim_type, c.value_text, c.confidence
+		FROM claims c JOIN parties p ON p.id = c.party_id
+		WHERE c.case_id = $1 AND p.role = $2
+		ORDER BY c.claim_type, c.created_at`, caseID, role)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []ClaimRecord
+	for rows.Next() {
+		var claim ClaimRecord
+		if err := rows.Scan(&claim.ClaimType, &claim.ValueText, &claim.Confidence); err != nil {
+			return nil, err
+		}
+		result = append(result, claim)
+	}
+	return result, rows.Err()
+}
+
+func classifyReplyDecision(text string) ReplyDecision {
+	normalized := strings.ToLower(strings.TrimSpace(text))
+	yesPattern := regexp.MustCompile(`^(yes|y|yeah|yep|accept|accepted|agree|agreed|correct)(\b|[.!])`)
+	noPattern := regexp.MustCompile(`^(no|n|nope|reject|rejected|decline|incorrect)(\b|[.!,:])`)
+	if yesPattern.MatchString(normalized) {
+		return DecisionYes
+	}
+	if noPattern.MatchString(normalized) {
+		return DecisionNo
+	}
+	return DecisionUnknown
+}
+
+func findDeterministicContradiction(a, b []ClaimRecord) (string, string) {
+	for _, claimType := range []string{"amount", "date"} {
+		aClaims := claimsOfType(a, claimType)
+		bClaims := claimsOfType(b, claimType)
+		if len(aClaims) == 0 || len(bClaims) == 0 || claimSetsEqual(aClaims, bClaims, claimType) {
+			continue
+		}
+		aVague, bVague := containsVague(aClaims), containsVague(bClaims)
+		if aVague && !bVague {
+			return "A", claimType
+		}
+		if bVague && !aVague {
+			return "B", claimType
+		}
+		// Stable tie-break: ask B first. Subsequent corrections naturally change
+		// the stored set; the per-party bound prevents an infinite loop.
+		return "B", claimType
+	}
+	return "", ""
+}
+
+func claimsOfType(claims []ClaimRecord, claimType string) []ClaimRecord {
+	var result []ClaimRecord
+	for _, claim := range claims {
+		if claim.ClaimType == claimType {
+			result = append(result, claim)
+		}
+	}
+	return result
+}
+
+func containsVague(claims []ClaimRecord) bool {
+	for _, claim := range claims {
+		if claim.Confidence == "vague" {
+			return true
+		}
+	}
+	return false
+}
+
+func claimSetsEqual(a, b []ClaimRecord, claimType string) bool {
+	values := func(claims []ClaimRecord) map[string]bool {
+		result := make(map[string]bool)
+		for _, claim := range claims {
+			result[canonicalClaimValue(claim.ValueText, claimType)] = true
+		}
+		return result
+	}
+	aValues, bValues := values(a), values(b)
+	if len(aValues) != len(bValues) {
+		return false
+	}
+	for value := range aValues {
+		if !bValues[value] {
+			return false
+		}
+	}
+	return true
+}
+
+func canonicalClaimValue(value, claimType string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if claimType == "amount" {
+		cleaned := regexp.MustCompile(`[^0-9.\-]`).ReplaceAllString(value, "")
+		if number, err := strconv.ParseFloat(cleaned, 64); err == nil {
+			return strconv.FormatFloat(number, 'f', 2, 64)
+		}
+	}
+	return strings.Join(strings.Fields(value), " ")
+}
+
 func getPartyDetailsByRole(ctx context.Context, tx pgx.Tx, caseID, role string) (partyID, convID, channel string, err error) {
 	err = tx.QueryRow(ctx, `
 		SELECT p.id, cl.conversation_id, cl.channel 
 		FROM parties p
 		JOIN conversation_links cl ON p.id = cl.party_id
-		WHERE p.case_id = $1 AND p.role = $2`, 
+		WHERE p.case_id = $1 AND p.role = $2`,
 		caseID, role).Scan(&partyID, &convID, &channel)
 	return
 }
@@ -1209,7 +1324,8 @@ func sendProactiveMessage(ctx context.Context, conversationID, text string) erro
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := http.DefaultClient.Do(req)
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -1217,6 +1333,83 @@ func sendProactiveMessage(ctx context.Context, conversationID, text string) erro
 
 	if resp.StatusCode >= 400 {
 		return fmt.Errorf("proactive send returned status code %d", resp.StatusCode)
+	}
+	return nil
+}
+
+func enqueueProactiveMessage(ctx context.Context, tx pgx.Tx, caseID, partyID, conversationID, channel, messageText string) error {
+	_, err := tx.Exec(ctx, `
+		INSERT INTO outbound_messages (id, case_id, party_id, conversation_id, channel, text)
+		VALUES ($1, $2, $3, $4, $5, $6)`, generateUUID(), caseID, partyID, conversationID, channel, messageText)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `
+		INSERT INTO messages_log (id, case_id, party_id, direction, channel, raw_text)
+		VALUES ($1, $2, $3, 'out', $4, $5)`, generateUUID(), caseID, partyID, channel, messageText)
+	return err
+}
+
+func runOutboxWorker(ctx context.Context, pool *pgxpool.Pool) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := deliverOneOutboxMessage(ctx, pool); err != nil {
+				log.Printf("Outbox delivery error: %v", err)
+			}
+		}
+	}
+}
+
+func deliverOneOutboxMessage(ctx context.Context, pool *pgxpool.Pool) error {
+	var id, conversationID, messageText string
+	err := pool.QueryRow(ctx, `
+		UPDATE outbound_messages SET status = 'processing', attempts = attempts + 1
+		WHERE id = (SELECT id FROM outbound_messages WHERE status IN ('pending','failed') AND attempts < 5 ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1)
+		RETURNING id, conversation_id, text`).Scan(&id, &conversationID, &messageText)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if err := sendProactiveMessage(ctx, conversationID, messageText); err != nil {
+		_, updateErr := pool.Exec(ctx, `UPDATE outbound_messages SET status = 'failed', last_error = $2 WHERE id = $1`, id, err.Error())
+		if updateErr != nil {
+			return updateErr
+		}
+		return err
+	}
+	_, err = pool.Exec(ctx, `UPDATE outbound_messages SET status = 'sent', sent_at = NOW(), last_error = NULL WHERE id = $1`, id)
+	return err
+}
+
+func ensureRuntimeSchema(ctx context.Context, pool *pgxpool.Pool) error {
+	statements := []string{
+		`ALTER TABLE cases ADD COLUMN IF NOT EXISTS cross_check_rounds_a SMALLINT NOT NULL DEFAULT 0`,
+		`ALTER TABLE cases ADD COLUMN IF NOT EXISTS cross_check_rounds_b SMALLINT NOT NULL DEFAULT 0`,
+		`CREATE TABLE IF NOT EXISTS outbound_messages (
+			id UUID PRIMARY KEY DEFAULT gen_random_uuid(), case_id UUID NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+			party_id UUID NOT NULL REFERENCES parties(id) ON DELETE CASCADE, conversation_id VARCHAR(255) NOT NULL,
+			channel VARCHAR(20) NOT NULL, text TEXT NOT NULL, status VARCHAR(12) NOT NULL DEFAULT 'pending'
+			CHECK (status IN ('pending','processing','sent','failed')), attempts SMALLINT NOT NULL DEFAULT 0,
+			last_error TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), sent_at TIMESTAMPTZ)`,
+		`CREATE INDEX IF NOT EXISTS idx_outbound_messages_pending ON outbound_messages (status, created_at)`,
+	}
+	for _, statement := range statements {
+		if _, err := pool.Exec(ctx, statement); err != nil {
+			return err
+		}
+	}
+	// A process may have stopped after claiming an outbox row but before
+	// delivery. Requeue those rows on startup; downstream retries are bounded.
+	_, err := pool.Exec(ctx, `UPDATE outbound_messages SET status = 'failed', last_error = 'worker restarted during delivery' WHERE status = 'processing'`)
+	if err != nil {
+		return err
 	}
 	return nil
 }

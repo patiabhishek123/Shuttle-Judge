@@ -15,7 +15,9 @@ CREATE TABLE cases (
                           'INTAKE','AWAITING_JOIN','INTAKE_B','CROSS_CHECK',
                           'PROPOSE','AWAITING_CONSENT','RESOLVED','STALLED'
                         )),
-    cross_check_rounds SMALLINT NOT NULL DEFAULT 0,        -- bounds the clarify loop, see DESIGN.md §4
+    cross_check_rounds SMALLINT NOT NULL DEFAULT 0,        -- aggregate count retained for reporting
+    cross_check_rounds_a SMALLINT NOT NULL DEFAULT 0,
+    cross_check_rounds_b SMALLINT NOT NULL DEFAULT 0,
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     resolved_at       TIMESTAMPTZ
@@ -87,6 +89,25 @@ CREATE TABLE messages_log (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX idx_messages_log_case ON messages_log (case_id, created_at);
+
+-- Transactional outbox. Mediation state and intended proactive deliveries are
+-- committed atomically; a background worker performs network I/O afterwards.
+CREATE TABLE outbound_messages (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    case_id         UUID NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+    party_id        UUID NOT NULL REFERENCES parties(id) ON DELETE CASCADE,
+    conversation_id VARCHAR(255) NOT NULL,
+    channel         VARCHAR(20) NOT NULL,
+    text            TEXT NOT NULL,
+    status          VARCHAR(12) NOT NULL DEFAULT 'pending'
+                      CHECK (status IN ('pending','processing','sent','failed')),
+    attempts        SMALLINT NOT NULL DEFAULT 0,
+    last_error      TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    sent_at         TIMESTAMPTZ
+);
+CREATE INDEX idx_outbound_messages_pending
+    ON outbound_messages (status, created_at);
 
 -- =========================================================
 -- claims: structured facts extracted from a party's free text
